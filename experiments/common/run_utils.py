@@ -57,14 +57,31 @@ def build_vllm_runtime(llm_cfg: dict[str, Any]) -> Any:
     Terrarium checks that a server is up with unauthenticated GETs, which a server
     started with --api-key rejects. When auto_start_server is off there is nothing
     to launch anyway, so skip the check; a bad URL or key fails on the first request.
+
+    Clients are StreamingVLLMClient rather than Terrarium's VLLMClient; see there.
     """
     from terrarium.utils import build_vllm_runtime as _build_vllm_runtime
+
+    from experiments.common.streaming_vllm_client import StreamingVLLMClient
 
     llm_cfg = dict(llm_cfg)
     llm_cfg["vllm"] = _expand_env_refs(llm_cfg.get("vllm") or {})
     runtime = _build_vllm_runtime(llm_cfg)
     if not runtime.global_config.auto_start_server:
         runtime.server_manager.ensure_server = lambda spec: None
+
+    def create_client(agent_name: str) -> tuple[StreamingVLLMClient, str]:
+        spec = runtime.global_config.get_model_for_agent(agent_name)
+        runtime.server_manager.ensure_server(spec)
+        client = StreamingVLLMClient(
+            base_url=spec.api_base(),
+            model_name=spec.served_name(),
+            api_key=spec.api_key or runtime.global_config.api_key or "EMPTY",
+            request_timeout=spec.request_timeout,
+        )
+        return client, spec.served_name()
+
+    runtime.create_client = create_client
     return runtime
 
 
