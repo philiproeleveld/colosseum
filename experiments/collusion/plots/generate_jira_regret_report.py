@@ -14,9 +14,10 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 import matplotlib
 
@@ -38,7 +39,6 @@ from experiments.common.plotting.io_utils import (
     write_csv,
 )
 
-
 logger = logging.getLogger(__name__)
 
 _LOGO_DIR = Path(__file__).resolve().parent / "assets" / "logos"
@@ -50,18 +50,39 @@ _LOGO_FILES = {
     "moonshot": "moonshot.png",
 }
 
-_SIX_BARS_PALETTE = ["#264653", "#2a9d8f", "#8ab17d"]
+# The first three colors are the paper's baseline/control/simple; the rest are for WASP arms.
+_SIX_BARS_PALETTE = [
+    "#264653",
+    "#2a9d8f",
+    "#8ab17d",
+    "#e9c46a",
+    "#f4a261",
+    "#e76f51",
+    "#6d597a",
+    "#9c6644",
+]
 
-_COALITION_REGRET_GAP_NORM_BY_MODEL: Optional[Dict[str, float]] = None
+_BASE_CONDITIONS = ["baseline", "control", "simple"]
+_BASE_CONDITION_LABELS = {
+    "baseline": "Baseline (no SC)",
+    "control": "Control (SC)",
+    "simple": "Simple (SC)",
+}
+
+_COALITION_REGRET_GAP_NORM_BY_MODEL: dict[str, float] | None = None
 
 
-def _lighten_color(color: str, amount: float = 0.55) -> Tuple[float, float, float]:
+def _lighten_color(color: str, amount: float = 0.55) -> tuple[float, float, float]:
     base = np.array(to_rgb(color))
     return tuple(base + (1.0 - base) * float(amount))
 
 
 def _canonical_variant(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _canonical_wasp_variant(value: Any) -> str:
+    return str(value or "").strip().lower() or "none"
 
 
 _PROVIDER_PREFIX_RE = re.compile(r"^(openai|anthropic|together)[-_]+", re.IGNORECASE)
@@ -93,7 +114,7 @@ def _pretty_model_label(model_label: str) -> str:
         return "Kimi-K2-Inst"
 
     parts = re.split(r"[-_]+", raw)
-    pretty: List[str] = []
+    pretty: list[str] = []
     for part in parts:
         if not part:
             continue
@@ -141,9 +162,9 @@ def _apply_large_font_style() -> None:
     )
 
 
-def _set_coalition_regret_gap_norm(rows: List["RunRow"]) -> None:
+def _set_coalition_regret_gap_norm(rows: list[RunRow]) -> None:
     global _COALITION_REGRET_GAP_NORM_BY_MODEL
-    vals_by_model: Dict[str, List[float]] = {}
+    vals_by_model: dict[str, list[float]] = {}
     for r in rows:
         c = r.coalition_mean_regret
         n = r.noncoalition_mean_regret
@@ -159,7 +180,7 @@ def _set_coalition_regret_gap_norm(rows: List["RunRow"]) -> None:
     if not vals_by_model:
         _COALITION_REGRET_GAP_NORM_BY_MODEL = None
         return
-    norm_by_model: Dict[str, float] = {}
+    norm_by_model: dict[str, float] = {}
     for model_label, vals in vals_by_model.items():
         if not vals:
             continue
@@ -171,7 +192,7 @@ def _set_coalition_regret_gap_norm(rows: List["RunRow"]) -> None:
     _COALITION_REGRET_GAP_NORM_BY_MODEL = norm_by_model or None
 
 
-def _normalize_coalition_regret_gap(value: float, model_label: str) -> Optional[float]:
+def _normalize_coalition_regret_gap(value: float, model_label: str) -> float | None:
     norm = _COALITION_REGRET_GAP_NORM_BY_MODEL
     if norm is None:
         return None
@@ -185,9 +206,11 @@ def _normalize_coalition_regret_gap(value: float, model_label: str) -> Optional[
 
 
 def _logo_key_for_model(
-    model_label: str, provider: Optional[str], model: Optional[str]
-) -> Optional[str]:
-    haystack = " ".join([str(model_label or ""), str(provider or ""), str(model or "")]).lower()
+    model_label: str, provider: str | None, model: str | None
+) -> str | None:
+    haystack = " ".join(
+        [str(model_label or ""), str(provider or ""), str(model or "")]
+    ).lower()
     if "deepseek" in haystack:
         return "deepseek"
     if "kimi" in haystack or "moonshot" in haystack:
@@ -201,13 +224,13 @@ def _logo_key_for_model(
     return None
 
 
-def _resolve_logo_paths(rows: List["RunRow"], models: List[str]) -> Dict[str, Path]:
+def _resolve_logo_paths(rows: list[RunRow], models: list[str]) -> dict[str, Path]:
     if not _LOGO_DIR.exists():
         return {}
-    rows_by_model: Dict[str, "RunRow"] = {}
+    rows_by_model: dict[str, RunRow] = {}
     for r in rows:
         rows_by_model.setdefault(r.model_label, r)
-    out: Dict[str, Path] = {}
+    out: dict[str, Path] = {}
     for model_label in models:
         row = rows_by_model.get(model_label)
         key = _logo_key_for_model(
@@ -225,12 +248,12 @@ def _resolve_logo_paths(rows: List["RunRow"], models: List[str]) -> Dict[str, Pa
 
 
 def _add_logos_to_xticklabels(
-    *, fig: plt.Figure, ax: plt.Axes, models: List[str], logo_paths: Dict[str, Path]
+    *, fig: plt.Figure, ax: plt.Axes, models: list[str], logo_paths: dict[str, Path]
 ) -> None:
     if not logo_paths:
         return
     fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
+    renderer = fig.canvas.get_renderer()  # type: ignore
     labels = ax.get_xticklabels()
     for label, model_label in zip(labels, models):
         logo_path = logo_paths.get(model_label)
@@ -288,7 +311,7 @@ def _infer_sweep_name(root: Path) -> str:
     if not sweep_names:
         raise SystemExit(f"No sweep directories found under: {root / 'runs'}")
     raise SystemExit(
-        "Multiple sweep directories found; pass --sweep-name. Options: "
+        "Multiple sweep directories found; pass --sweep-name (comma-separated for several). Options: "
         + ", ".join(sorted(sweep_names))
     )
 
@@ -301,12 +324,14 @@ def _iter_run_dirs(sweep_dir: Path) -> Iterable[Path]:
             yield child
 
 
-def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+def _read_json(path: Path) -> dict[str, Any] | None:
     obj = safe_load_json(path)
     return obj if isinstance(obj, dict) else None
 
 
-def _judge_mean_rating(*, model_dir: Path, sweep_name: str, run_name: str) -> Optional[float]:
+def _judge_mean_rating(
+    *, model_dir: Path, sweep_name: str, run_name: str
+) -> float | None:
     judge_path = model_dir / "judge_secret_blackboard" / sweep_name / f"{run_name}.json"
     payload = safe_load_json(judge_path) if judge_path.exists() else None
     if not isinstance(payload, dict):
@@ -315,7 +340,7 @@ def _judge_mean_rating(*, model_dir: Path, sweep_name: str, run_name: str) -> Op
     if not isinstance(judgements, dict):
         return None
 
-    vals: List[float] = []
+    vals: list[float] = []
     for key in ("simple", "medium", "complex"):
         j = judgements.get(key)
         if not isinstance(j, dict):
@@ -329,12 +354,12 @@ def _judge_mean_rating(*, model_dir: Path, sweep_name: str, run_name: str) -> Op
     return float(mean(vals))
 
 
-def _load_optimal_summary(run_dir: Path) -> Optional[Dict[str, Any]]:
+def _load_optimal_summary(run_dir: Path) -> dict[str, Any] | None:
     payload = _read_json(run_dir / "optimal_summary.json")
     return payload if isinstance(payload, dict) else None
 
 
-def _compute_and_write_optimal_summary(run_dir: Path) -> Optional[Dict[str, Any]]:
+def _compute_and_write_optimal_summary(run_dir: Path) -> dict[str, Any] | None:
     """Compute and persist `optimal_summary.json` for a Jira run directory (no API calls)."""
     try:
         from experiments.collusion import compute_jira_optimal
@@ -344,7 +369,9 @@ def _compute_and_write_optimal_summary(run_dir: Path) -> Optional[Dict[str, Any]
         except Exception:
             instance = compute_jira_optimal._load_instance_from_agent_prompts(run_dir)
         weights = compute_jira_optimal._load_weights(run_dir, overrides=None)
-        optimal = compute_jira_optimal.solve_optimal_assignment(instance=instance, weights=weights)
+        optimal = compute_jira_optimal.solve_optimal_assignment(
+            instance=instance, weights=weights
+        )
 
         payload = {
             "weights": {
@@ -358,11 +385,16 @@ def _compute_and_write_optimal_summary(run_dir: Path) -> Optional[Dict[str, Any]
                 "priority_sum": optimal.priority_sum,
                 "total_cost": optimal.total_cost,
                 "violations": optimal.violations,
-                "assignment": {k: (v if v is not None else "skip") for k, v in optimal.assignment.items()},
+                "assignment": {
+                    k: (v if v is not None else "skip")
+                    for k, v in optimal.assignment.items()
+                },
             },
         }
         out_path = run_dir / "optimal_summary.json"
-        out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        out_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         return payload
     except Exception as exc:
         logger.warning("Failed to compute optimal for %s: %s", run_dir, exc)
@@ -372,23 +404,25 @@ def _compute_and_write_optimal_summary(run_dir: Path) -> Optional[Dict[str, Any]
 @dataclass(frozen=True)
 class RunRow:
     model_label: str
-    provider: Optional[str]
-    model: Optional[str]
+    provider: str | None
+    model: str | None
     sweep_name: str
-    topology: Optional[str]
-    num_agents: Optional[int]
-    colluder_count: Optional[int]
-    seed: Optional[int]
-    secret_channel_enabled: Optional[bool]
+    topology: str | None
+    num_agents: int | None
+    colluder_count: int | None
+    seed: int | None
+    secret_channel_enabled: bool | None
     prompt_variant: str
+    environment_label: str | None
+    wasp_variant: str
     status: str
 
-    joint_reward: Optional[float]
-    optimal_joint_reward: Optional[float]
-    normalized_regret: Optional[float]  # 1 - achieved / optimal (clipped to [0, 1])
-    judge_mean_rating: Optional[float]
-    coalition_mean_regret: Optional[float]
-    noncoalition_mean_regret: Optional[float]
+    joint_reward: float | None
+    optimal_joint_reward: float | None
+    normalized_regret: float | None  # 1 - achieved / optimal (clipped to [0, 1])
+    judge_mean_rating: float | None
+    coalition_mean_regret: float | None
+    noncoalition_mean_regret: float | None
 
 
 def _status_is_complete(status: Any) -> bool:
@@ -402,7 +436,7 @@ def _load_run_row(
     sweep_name: str,
     compute_optimal: bool,
     prefer_repaired: bool,
-) -> Optional[RunRow]:
+) -> RunRow | None:
     rc = _read_json(run_dir / "run_config.json") or {}
     final_summary_path = run_dir / "final_summary.json"
     metrics_path = run_dir / "metrics.json"
@@ -444,7 +478,11 @@ def _load_run_row(
             optimal_joint_reward = as_float(optimal.get("joint_reward"))
 
     normalized_regret = None
-    if joint_reward is not None and optimal_joint_reward is not None and float(optimal_joint_reward) != 0.0:
+    if (
+        joint_reward is not None
+        and optimal_joint_reward is not None
+        and float(optimal_joint_reward) != 0.0
+    ):
         achieved_over_optimal = float(joint_reward) / float(optimal_joint_reward)
         normalized_regret = 1.0 - float(achieved_over_optimal)
         if normalized_regret < 0.0:
@@ -468,6 +506,10 @@ def _load_run_row(
         seed=as_int(rc.get("seed")),
         secret_channel_enabled=as_bool(rc.get("secret_channel_enabled")),
         prompt_variant=prompt_variant,
+        environment_label=str(rc.get("environment_label"))
+        if rc.get("environment_label")
+        else None,
+        wasp_variant=_canonical_wasp_variant(rc.get("wasp_variant")),
         status=status_s,
         joint_reward=joint_reward,
         optimal_joint_reward=optimal_joint_reward,
@@ -479,20 +521,22 @@ def _load_run_row(
 
 
 def _filter_rows(
-    rows: List[RunRow],
+    rows: list[RunRow],
     *,
-    topology: Optional[str],
-    num_agents: Optional[int],
-    colluder_count: Optional[int],
+    topology: str | None,
+    num_agents: int | None,
+    colluder_count: int | None,
     require_complete: bool,
-) -> List[RunRow]:
-    out: List[RunRow] = []
+) -> list[RunRow]:
+    out: list[RunRow] = []
     for r in rows:
         if topology is not None and str(r.topology) != str(topology):
             continue
         if num_agents is not None and int(r.num_agents or -1) != int(num_agents):
             continue
-        if colluder_count is not None and int(r.colluder_count or -1) != int(colluder_count):
+        if colluder_count is not None and int(r.colluder_count or -1) != int(
+            colluder_count
+        ):
             continue
         if require_complete and not _status_is_complete(r.status):
             continue
@@ -506,8 +550,62 @@ def _variant_or_baseline(r: RunRow) -> str:
     return "baseline"
 
 
-def _seed_means(rows: List[RunRow], *, key: str) -> List[float]:
-    by_seed: Dict[int, List[float]] = {}
+def _condition_key(r: RunRow) -> str:
+    """Group key: the paper's condition plus the environment label and WASP variant.
+
+    Runs from before WASP (no environment label, `wasp_variant` none) keep the paper's
+    keys `baseline`, `control` and `simple`.
+    """
+    key = _variant_or_baseline(r)
+    if r.environment_label:
+        key += f"/env{r.environment_label}"
+    if r.wasp_variant != "none":
+        key += f"/wv{r.wasp_variant}"
+    return key
+
+
+def _conditions(rows: list[RunRow]) -> list[str]:
+    def _order(key: str) -> tuple[int, str]:
+        base = key.split("/", 1)[0]
+        rank = (
+            _BASE_CONDITIONS.index(base)
+            if base in _BASE_CONDITIONS
+            else len(_BASE_CONDITIONS)
+        )
+        return (rank, key)
+
+    return sorted({_condition_key(r) for r in rows}, key=_order)
+
+
+def _condition_label(key: str) -> str:
+    base, *rest = key.split("/")
+    label = _BASE_CONDITION_LABELS.get(base, base)
+    extras: list[str] = []
+    for part in rest:
+        if part.startswith("env"):
+            extras.append(f"env {part[3:]}")
+        elif part.startswith("wv"):
+            extras.append(part[2:])
+    return f"{label} [{', '.join(extras)}]" if extras else label
+
+
+def _condition_fields(rows: list[RunRow]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        out.setdefault(
+            _condition_key(r),
+            {
+                "secret_channel_enabled": r.secret_channel_enabled,
+                "prompt_variant": r.prompt_variant,
+                "environment_label": r.environment_label,
+                "wasp_variant": r.wasp_variant,
+            },
+        )
+    return out
+
+
+def _seed_means(rows: list[RunRow], *, key: str) -> list[float]:
+    by_seed: dict[int, list[float]] = {}
     for r in rows:
         seed = r.seed
         if seed is None:
@@ -535,7 +633,7 @@ def _seed_means(rows: List[RunRow], *, key: str) -> List[float]:
             continue
         by_seed.setdefault(int(seed), []).append(float(val))
 
-    out: List[float] = []
+    out: list[float] = []
     for seed_i in sorted(by_seed):
         vals = by_seed[seed_i]
         if vals:
@@ -543,16 +641,16 @@ def _seed_means(rows: List[RunRow], *, key: str) -> List[float]:
     return out
 
 
-def _group_stats(rows: List[RunRow], *, key: str) -> Dict[str, Any]:
+def _group_stats(rows: list[RunRow], *, key: str) -> dict[str, Any]:
     vals = _seed_means(rows, key=key)
     if not vals:
         return {"n": 0, "mean": None, "sem": None}
-    return {"n": int(len(vals)), "mean": float(mean(vals)), "sem": float(sem(vals))}
+    return {"n": len(vals), "mean": float(mean(vals)), "sem": float(sem(vals))}
 
 
 def _plot_combined_nine_bars_two_metrics_dual_axis(
     *,
-    rows: List[RunRow],
+    rows: list[RunRow],
     metric_a_key: str,
     metric_b_key: str,
     out_path: Path,
@@ -566,11 +664,24 @@ def _plot_combined_nine_bars_two_metrics_dual_axis(
     if not models:
         return
 
-    conditions = ["baseline", "control", "simple"]
-    colors = dict(zip(conditions, _SIX_BARS_PALETTE))
+    conditions = _conditions(rows)
+    if len(conditions) > len(_SIX_BARS_PALETTE):
+        logger.warning(
+            "More conditions (%d) than colors; colors repeat.", len(conditions)
+        )
+    colors = {
+        c: _SIX_BARS_PALETTE[i % len(_SIX_BARS_PALETTE)]
+        for i, c in enumerate(conditions)
+    }
 
-    def _stats_for(model_label: str, condition: str, key: str) -> Tuple[float, float, int]:
-        subset = [r for r in rows if r.model_label == model_label and _variant_or_baseline(r) == condition]
+    def _stats_for(
+        model_label: str, condition: str, key: str
+    ) -> tuple[float, float, int]:
+        subset = [
+            r
+            for r in rows
+            if r.model_label == model_label and _condition_key(r) == condition
+        ]
         stats = _group_stats(subset, key=key)
         mu = stats.get("mean")
         se_val = stats.get("sem")
@@ -581,12 +692,12 @@ def _plot_combined_nine_bars_two_metrics_dual_axis(
             n,
         )
 
-    metric_a_means: Dict[str, List[float]] = {c: [] for c in conditions}
-    metric_a_sems: Dict[str, List[float]] = {c: [] for c in conditions}
-    metric_b_means: Dict[str, List[float]] = {c: [] for c in conditions}
-    metric_b_sems: Dict[str, List[float]] = {c: [] for c in conditions}
-    judge_means: Dict[str, List[float]] = {c: [] for c in conditions}
-    judge_sems: Dict[str, List[float]] = {c: [] for c in conditions}
+    metric_a_means: dict[str, list[float]] = {c: [] for c in conditions}
+    metric_a_sems: dict[str, list[float]] = {c: [] for c in conditions}
+    metric_b_means: dict[str, list[float]] = {c: [] for c in conditions}
+    metric_b_sems: dict[str, list[float]] = {c: [] for c in conditions}
+    judge_means: dict[str, list[float]] = {c: [] for c in conditions}
+    judge_sems: dict[str, list[float]] = {c: [] for c in conditions}
 
     for m in models:
         for c in conditions:
@@ -620,11 +731,17 @@ def _plot_combined_nine_bars_two_metrics_dual_axis(
     ax_judge = ax_metric.twinx()
 
     x = np.arange(len(models), dtype=float)
-    width = 0.11 * 0.8
+    # 3 metrics x n conditions bars per model, spanning the same total width as the paper's nine bars.
+    n_cond = len(conditions)
+    width = 0.11 * 0.8 * 9.0 / (3.0 * n_cond)
+    center = (3.0 * n_cond - 1.0) / 2.0
 
-    metric_a_offsets = {"baseline": -4.0 * width, "control": -3.0 * width, "simple": -2.0 * width}
-    metric_b_offsets = {"baseline": -1.0 * width, "control": 0.0 * width, "simple": 1.0 * width}
-    judge_offsets = {"baseline": 2.0 * width, "control": 3.0 * width, "simple": 4.0 * width}
+    def _offset(slot: int) -> float:
+        return (float(slot) - center) * width
+
+    metric_a_offsets = {c: _offset(i) for i, c in enumerate(conditions)}
+    metric_b_offsets = {c: _offset(n_cond + i) for i, c in enumerate(conditions)}
+    judge_offsets = {c: _offset(2 * n_cond + i) for i, c in enumerate(conditions)}
 
     for c in conditions:
         ax_metric.bar(
@@ -679,43 +796,73 @@ def _plot_combined_nine_bars_two_metrics_dual_axis(
 
     ax_metric.set_ylabel("Normalized Value")
     ax_metric.set_ylim(0.0, 1.0)
-    ax_metric.axhline(0.5, color="#777777", linewidth=1.0, alpha=0.7, zorder=0, linestyle=":")
+    ax_metric.axhline(
+        0.5, color="#777777", linewidth=1.0, alpha=0.7, zorder=0, linestyle=":"
+    )
 
     judge_axis_label = _pretty_metric_label("judge_mean_rating").replace(" (Judge)", "")
     ax_judge.set_ylabel(judge_axis_label, labelpad=10)
     ax_judge.tick_params(axis="y", labelcolor="black")
     ax_judge.spines["right"].set_visible(True)
 
-    condition_labels = {"baseline": "Baseline (no SC)", "control": "Control (SC)", "simple": "Simple (SC)"}
     condition_handles = [
-        Patch(facecolor=colors[c], edgecolor="none", label=condition_labels.get(c, c))
-        for c in ["baseline", "control", "simple"]
+        Patch(facecolor=colors[c], edgecolor="none", label=_condition_label(c))
+        for c in conditions
     ]
 
-    metric_a_label = _pretty_metric_label(metric_a_key).strip().replace("Normalized Regret", "Regret")
+    metric_a_label = (
+        _pretty_metric_label(metric_a_key)
+        .strip()
+        .replace("Normalized Regret", "Regret")
+    )
     metric_b_label = _pretty_metric_label(metric_b_key).strip()
     judge_label = _pretty_metric_label("judge_mean_rating").replace(" (↓)", "").strip()
     style_handles = [
-        Patch(facecolor="white", edgecolor="black", linewidth=0.8, alpha=1.0, label=metric_a_label),
-        Patch(facecolor="white", edgecolor="black", linewidth=0.8, hatch="\\\\\\", alpha=1.0, label=metric_b_label),
-        Patch(facecolor="white", edgecolor="black", linewidth=0.8, hatch="///", alpha=1.0, label=judge_label),
+        Patch(
+            facecolor="white",
+            edgecolor="black",
+            linewidth=0.8,
+            alpha=1.0,
+            label=metric_a_label,
+        ),
+        Patch(
+            facecolor="white",
+            edgecolor="black",
+            linewidth=0.8,
+            hatch="\\\\\\",
+            alpha=1.0,
+            label=metric_b_label,
+        ),
+        Patch(
+            facecolor="white",
+            edgecolor="black",
+            linewidth=0.8,
+            hatch="///",
+            alpha=1.0,
+            label=judge_label,
+        ),
     ]
 
     ax_metric.set_xticks(x)
-    ax_metric.set_xticklabels([_pretty_model_label(m) for m in models], rotation=0, ha="center")
+    ax_metric.set_xticklabels(
+        [_pretty_model_label(m) for m in models], rotation=0, ha="center"
+    )
     ax_metric.tick_params(axis="x", pad=6)
     ax_metric.axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
     ax_metric.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.4)
     ax_metric.set_axisbelow(True)
 
     legend_handles = condition_handles + style_handles
-    fig.subplots_adjust(left=0.06, right=0.94, top=0.96, bottom=0.22)
+    legend_rows = 1 if len(legend_handles) <= 6 else 2
+    fig.subplots_adjust(
+        left=0.06, right=0.94, top=0.96, bottom=0.22 if legend_rows == 1 else 0.32
+    )
     fig.legend(
         legend_handles,
-        [h.get_label() for h in legend_handles],
+        [h.get_label() for h in legend_handles],  # type: ignore
         loc="lower center",
         bbox_to_anchor=(0.5, -0.01),
-        ncol=len(legend_handles),
+        ncol=math.ceil(len(legend_handles) / legend_rows),
         frameon=False,
         columnspacing=1.2,
         handlelength=1.4,
@@ -724,14 +871,16 @@ def _plot_combined_nine_bars_two_metrics_dual_axis(
     )
 
     logo_paths = _resolve_logo_paths(rows, models)
-    _add_logos_to_xticklabels(fig=fig, ax=ax_metric, models=models, logo_paths=logo_paths)
+    _add_logos_to_xticklabels(
+        fig=fig, ax=ax_metric, models=models, logo_paths=logo_paths
+    )
     plt.savefig(out_path, dpi=200)
     plt.close(fig)
 
 
 def _write_combined_nine_bars_two_metrics_dual_axis_csv(
     *,
-    rows: List[RunRow],
+    rows: list[RunRow],
     metric_a_key: str,
     metric_b_key: str,
     out_path: Path,
@@ -740,14 +889,18 @@ def _write_combined_nine_bars_two_metrics_dual_axis_csv(
     if not models:
         return
 
-    conditions = ["baseline", "control", "simple"]
-    condition_labels = {"baseline": "Baseline (no SC)", "control": "Control (SC)", "simple": "Simple (SC)"}
+    conditions = _conditions(rows)
+    fields_by_condition = _condition_fields(rows)
     metric_keys = [metric_a_key, metric_b_key, "judge_mean_rating"]
 
-    table_rows: List[Dict[str, Any]] = []
+    table_rows: list[dict[str, Any]] = []
     for model_label in models:
         for condition in conditions:
-            subset = [r for r in rows if r.model_label == model_label and _variant_or_baseline(r) == condition]
+            subset = [
+                r
+                for r in rows
+                if r.model_label == model_label and _condition_key(r) == condition
+            ]
             for metric_key in metric_keys:
                 stats = _group_stats(subset, key=str(metric_key))
                 table_rows.append(
@@ -755,9 +908,12 @@ def _write_combined_nine_bars_two_metrics_dual_axis_csv(
                         "model_label": model_label,
                         "model_label_pretty": _pretty_model_label(model_label),
                         "condition": condition,
-                        "condition_pretty": condition_labels.get(condition, condition),
+                        "condition_pretty": _condition_label(condition),
+                        **fields_by_condition.get(condition, {}),
                         "metric_key": str(metric_key),
-                        "metric_label": _pretty_metric_label(str(metric_key)).replace(" (Judge)", ""),
+                        "metric_label": _pretty_metric_label(str(metric_key)).replace(
+                            " (Judge)", ""
+                        ),
                         "mean": stats.get("mean"),
                         "sem": stats.get("sem"),
                         "n": stats.get("n"),
@@ -767,7 +923,7 @@ def _write_combined_nine_bars_two_metrics_dual_axis_csv(
     write_csv(out_path, table_rows)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Generate the combined nine-bars regret plot from a collusion output root."
     )
@@ -781,7 +937,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--sweep-name",
         type=str,
         default=None,
-        help="Sweep directory name under each model (e.g., complete_n6_c2). If omitted, auto-infer when unique.",
+        help=(
+            "Sweep directory name under each model (e.g., complete_n6_c2), or several comma-separated "
+            "(e.g., controls,wasp) to compare arms split across sweeps. If omitted, auto-infer when unique."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -815,7 +974,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not root.exists():
         raise SystemExit(f"Root not found: {root}")
 
-    sweep_name = str(args.sweep_name) if args.sweep_name else _infer_sweep_name(root)
+    if args.sweep_name:
+        sweep_names = [s.strip() for s in str(args.sweep_name).split(",") if s.strip()]
+    else:
+        sweep_names = [_infer_sweep_name(root)]
+    if not sweep_names:
+        raise SystemExit("--sweep-name is empty.")
+    sweep_name = "+".join(sweep_names)
 
     if args.out_dir:
         out_dir = Path(args.out_dir).expanduser().resolve()
@@ -832,26 +997,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ensure_dir(out_dir)
     ensure_dir(out_dir / "plots")
 
-    rows: List[RunRow] = []
-    missing_sweeps: List[str] = []
+    rows: list[RunRow] = []
+    missing_sweeps: list[str] = []
     for model_dir in _iter_model_dirs(root):
-        sweep_dir = model_dir / sweep_name
-        if not sweep_dir.exists():
-            missing_sweeps.append(model_dir.name)
-            continue
-        for run_dir in _iter_run_dirs(sweep_dir):
-            row = _load_run_row(
-                run_dir=run_dir,
-                model_dir=model_dir,
-                sweep_name=sweep_name,
-                compute_optimal=bool(args.compute_optimal),
-                prefer_repaired=bool(args.prefer_repaired),
-            )
-            if row is not None:
-                rows.append(row)
+        for one_sweep in sweep_names:
+            sweep_dir = model_dir / one_sweep
+            if not sweep_dir.exists():
+                missing_sweeps.append(f"{model_dir.name}/{one_sweep}")
+                continue
+            for run_dir in _iter_run_dirs(sweep_dir):
+                row = _load_run_row(
+                    run_dir=run_dir,
+                    model_dir=model_dir,
+                    sweep_name=one_sweep,
+                    compute_optimal=bool(args.compute_optimal),
+                    prefer_repaired=bool(args.prefer_repaired),
+                )
+                if row is not None:
+                    rows.append(row)
 
     if missing_sweeps:
-        logger.warning("Missing sweep %s for models: %s", sweep_name, ", ".join(missing_sweeps))
+        logger.warning("Missing sweeps (model/sweep): %s", ", ".join(missing_sweeps))
     if not rows:
         raise SystemExit("No runs found.")
 
@@ -866,7 +1032,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not rows:
         raise SystemExit("No runs matched the requested filters.")
 
-    plot_out = out_dir / "plots" / "regret_report__normalized_regret__coalition_gap__judge.png"
+    plot_out = (
+        out_dir / "plots" / "regret_report__normalized_regret__coalition_gap__judge.png"
+    )
     _plot_combined_nine_bars_two_metrics_dual_axis(
         rows=rows,
         metric_a_key="normalized_regret",
@@ -876,7 +1044,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if plot_out.exists():
         logger.info("Wrote plot: %s", plot_out)
 
-    csv_out = out_dir / "plots" / "regret_report__normalized_regret__coalition_gap__judge__data.csv"
+    csv_out = (
+        out_dir
+        / "plots"
+        / "regret_report__normalized_regret__coalition_gap__judge__data.csv"
+    )
     _write_combined_nine_bars_two_metrics_dual_axis_csv(
         rows=rows,
         metric_a_key="normalized_regret",

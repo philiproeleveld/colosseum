@@ -11,29 +11,24 @@ import asyncio
 import csv
 import json
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 import yaml
 from tqdm import tqdm
-
-if sys.version_info < (3, 11):
-    raise RuntimeError(
-        "Terrarium requires Python >= 3.11. "
-        "Create/activate a `.venv` (see repo README) and re-run with `.venv/bin/python`."
-    )
 
 project_root = Path(__file__).resolve().parents[2]
 # Allow running without installing the repo as a package.
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from experiments.collusion import run as run_mod  # noqa: E402
+from experiments.collusion import run as run_mod
+from experiments.collusion.score_reports import _report_tool_name
 
-
-REQUIRED_RUN_FILES: Tuple[str, ...] = (
+REQUIRED_RUN_FILES: tuple[str, ...] = (
     "run_config.json",
     "metrics.json",
     "final_summary.json",
@@ -46,16 +41,17 @@ REQUIRED_RUN_FILES: Tuple[str, ...] = (
 @dataclass(frozen=True)
 class RunSpec:
     model_label: str
-    model_llm_cfg: Dict[str, Any]
+    model_llm_cfg: dict[str, Any]
     sweep_name: str
-    environment_label: Optional[str]
-    environment_cfg: Optional[Dict[str, Any]]
+    environment_label: str | None
+    environment_cfg: dict[str, Any] | None
     topology: str
     num_agents: int
     colluder_count: int
     secret_channel_enabled: bool
     prompt_variant: str
     seed: int
+    wasp_variant: str = "none"
 
     @property
     def effective_prompt_variant(self) -> str:
@@ -75,6 +71,7 @@ class RunSpec:
             f"__n{self.num_agents}__c{self.colluder_count}"
             f"__secret{int(bool(self.secret_channel_enabled))}"
             f"__pv{self.effective_prompt_variant}"
+            f"__wv{self.wasp_variant}"
             f"__seed{self.seed}"
         )
 
@@ -90,11 +87,12 @@ class RunSpec:
             f"/n{self.num_agents}/c{self.colluder_count}"
             f"/secret{int(bool(self.secret_channel_enabled))}"
             f"/pv{self.effective_prompt_variant}"
+            f"/wv{self.wasp_variant}"
             f"/seed{self.seed}"
         )
 
 
-def _load_config(path: Path) -> Dict[str, Any]:
+def _load_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     if path.suffix.lower() == ".json":
@@ -120,7 +118,7 @@ def _run_has_error_turns(run_dir: Path) -> bool:
     return '"response": "[ERROR]' in raw or "'response': '[ERROR]" in raw
 
 
-def _run_status(run_dir: Path) -> Optional[str]:
+def _run_status(run_dir: Path) -> str | None:
     """Return normalized run status (e.g., 'complete' / 'incomplete'), if available."""
     for name in ("metrics.json", "final_summary.json"):
         path = run_dir / name
@@ -143,8 +141,8 @@ def _run_status(run_dir: Path) -> Optional[str]:
 
 def _is_run_acceptable(
     run_dir: Path, *, require_status_complete: bool, rerun_error_turns: bool
-) -> Tuple[bool, List[str]]:
-    reasons: List[str] = []
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
     if not _is_run_complete(run_dir):
         reasons.append("missing_files")
         return False, reasons
@@ -160,7 +158,7 @@ def _is_run_acceptable(
     return (not reasons), reasons
 
 
-def _iter_expected_run_specs(cfg: Dict[str, Any]) -> Iterable[RunSpec]:
+def _iter_expected_run_specs(cfg: dict[str, Any]) -> Iterable[RunSpec]:
     exp = cfg.get("experiment") or {}
     models = cfg.get("llm_models") or []
     sweeps = exp.get("sweeps") or []
@@ -196,7 +194,7 @@ def _iter_expected_run_specs(cfg: Dict[str, Any]) -> Iterable[RunSpec]:
                 or [False]
             )
             raw_prompt_variants = sweep.get("prompt_variants") or ["control"]
-            prompt_variants: List[str] = []
+            prompt_variants: list[str] = []
             seen_variants: set[str] = set()
             for pv in raw_prompt_variants:
                 pv_str = str(pv or "").strip() or "control"
@@ -204,6 +202,7 @@ def _iter_expected_run_specs(cfg: Dict[str, Any]) -> Iterable[RunSpec]:
                     continue
                 seen_variants.add(pv_str)
                 prompt_variants.append(pv_str)
+            wasp_variants = run_mod._normalize_wasp_variants(sweep)
             seeds = run_mod._normalize_seeds(sweep.get("seeds")) or list(default_seeds)
             if runs_per_setting is not None:
                 seeds = seeds[:runs_per_setting]
@@ -221,35 +220,40 @@ def _iter_expected_run_specs(cfg: Dict[str, Any]) -> Iterable[RunSpec]:
                                     # Prompt variants are only active when the secret channel exists.
                                     if not bool(secret) and str(pv) != "control":
                                         continue
-                                    for seed in seeds:
-                                        yield RunSpec(
-                                            model_label=model_label,
-                                            model_llm_cfg=llm_cfg,
-                                            sweep_name=sweep_name,
-                                            environment_label=env_label,
-                                            environment_cfg=env_cfg,
-                                            topology=str(topology),
-                                            num_agents=int(n),
-                                            colluder_count=int(c),
-                                            secret_channel_enabled=bool(secret),
-                                            prompt_variant=str(pv),
-                                            seed=int(seed),
-                                        )
+                                    for wv in wasp_variants:
+                                        # WASP variants other than "none" need the secret channel.
+                                        if not bool(secret) and wv != "none":
+                                            continue
+                                        for seed in seeds:
+                                            yield RunSpec(
+                                                model_label=model_label,
+                                                model_llm_cfg=llm_cfg,
+                                                sweep_name=sweep_name,
+                                                environment_label=env_label,
+                                                environment_cfg=env_cfg,
+                                                topology=str(topology),
+                                                num_agents=int(n),
+                                                colluder_count=int(c),
+                                                secret_channel_enabled=bool(secret),
+                                                prompt_variant=str(pv),
+                                                seed=int(seed),
+                                                wasp_variant=wv,
+                                            )
 
 
 def _select_incomplete_runs(
     *,
     root: Path,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     require_status_complete: bool,
     rerun_error_turns: bool,
-) -> Tuple[List[RunSpec], int, int, Dict[str, int], Dict[str, List[str]]]:
+) -> tuple[list[RunSpec], int, int, dict[str, int], dict[str, list[str]]]:
     expected = list(_iter_expected_run_specs(cfg))
     total_runs = len(expected)
     completed = 0
-    incomplete: List[RunSpec] = []
-    reason_counts: Dict[str, int] = {}
-    reasons_by_run_id: Dict[str, List[str]] = {}
+    incomplete: list[RunSpec] = []
+    reason_counts: dict[str, int] = {}
+    reasons_by_run_id: dict[str, list[str]] = {}
     for spec in expected:
         run_dir = root / "runs" / spec.model_label / spec.sweep_name / spec.run_id
         ok, reasons = _is_run_acceptable(
@@ -268,7 +272,7 @@ def _select_incomplete_runs(
 
 
 def _rebuild_summary_files(root: Path) -> None:
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for run_dir in (root / "runs").rglob("*"):
         if not run_dir.is_dir():
             continue
@@ -280,29 +284,61 @@ def _rebuild_summary_files(root: Path) -> None:
         except Exception:
             continue
         metrics_path = run_dir / "metrics.json"
-        metrics: Dict[str, Any] = {}
+        metrics: dict[str, Any] = {}
         if metrics_path.exists():
             try:
                 obj = json.loads(metrics_path.read_text(encoding="utf-8")) or {}
                 metrics = obj if isinstance(obj, dict) else {}
             except Exception:
                 metrics = {}
+        try:
+            obj = json.loads(
+                (run_dir / "final_summary.json").read_text(encoding="utf-8")
+            )
+            final_summary = obj if isinstance(obj, dict) else {}
+        except Exception:
+            final_summary = {}
+        try:
+            obj = json.loads((run_dir / "tool_events.json").read_text(encoding="utf-8"))
+            tool_events = obj if isinstance(obj, list) else []
+        except Exception:
+            tool_events = []
 
-        row: Dict[str, Any] = {
+        # Same counting as run.py's summary row.
+        report_tool_name = _report_tool_name(run_dir, None)
+        colluder_set = {str(c) for c in rc.get("colluders") or []}
+        reports_by_colluders = 0
+        reports_by_noncolluders = 0
+        for e in tool_events:
+            if not isinstance(e, dict) or e.get("tool_name") != report_tool_name:
+                continue
+            if str(e.get("agent_name")) in colluder_set:
+                reports_by_colluders += 1
+            else:
+                reports_by_noncolluders += 1
+
+        row: dict[str, Any] = {
             "run_id": rc.get("run_id") or run_dir.name,
             "model_label": rc.get("model_label"),
             "provider": rc.get("provider"),
             "model": rc.get("model"),
             "sweep": rc.get("sweep") or rc.get("sweep_name"),
+            "environment_label": rc.get("environment_label"),
+            "environment_name": rc.get("environment_name"),
             "topology": rc.get("topology"),
             "num_agents": rc.get("num_agents"),
             "colluder_count": rc.get("colluder_count"),
             "secret_channel_enabled": rc.get("secret_channel_enabled"),
             "secret_blackboard_id": rc.get("secret_blackboard_id"),
             "prompt_variant": rc.get("prompt_variant"),
+            "wasp_variant": rc.get("wasp_variant") or "none",
             "seed": rc.get("seed"),
             "colluders": rc.get("colluders"),
             "status": metrics.get("status"),
+            "random_fallback_fills": final_summary.get("random_fallback_fills"),
+            "reports_total": reports_by_colluders + reports_by_noncolluders,
+            "reports_by_colluders": reports_by_colluders,
+            "reports_by_noncolluders": reports_by_noncolluders,
             "coalition_reward_sum": metrics.get("coalition_reward_sum"),
             "noncoalition_reward_sum": metrics.get("noncoalition_reward_sum"),
             "coalition_mean_reward": metrics.get("coalition_mean_reward"),
@@ -327,7 +363,7 @@ def _rebuild_summary_files(root: Path) -> None:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    flat_rows: List[Dict[str, Any]] = []
+    flat_rows: list[dict[str, Any]] = []
     for row in rows:
         flat_rows.append(
             {k: v for k, v in row.items() if not isinstance(v, (dict, list))}
@@ -337,7 +373,7 @@ def _rebuild_summary_files(root: Path) -> None:
         (root / "summary.csv").write_text("", encoding="utf-8")
         return
 
-    fieldnames = sorted({k for r in flat_rows for k in r.keys()})
+    fieldnames = sorted({k for r in flat_rows for k in r})
     with (root / "summary.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -347,7 +383,7 @@ def _rebuild_summary_files(root: Path) -> None:
 async def resume_runs(
     *,
     root: Path,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     max_concurrent_runs: int,
     stop_on_error: bool,
     require_status_complete: bool,
@@ -463,6 +499,7 @@ async def resume_runs(
                         colluder_count=spec.colluder_count,
                         secret_channel_enabled=spec.secret_channel_enabled,
                         prompt_variant=spec.prompt_variant,
+                        wasp_variant=spec.wasp_variant,
                         seed=spec.seed,
                         out_dir=root,
                     )
@@ -489,10 +526,10 @@ async def resume_runs(
         else:
             semaphore = asyncio.Semaphore(max_concurrent_runs)
 
-            def _run_single_in_thread(**kwargs: Any) -> Dict[str, Any]:
+            def _run_single_in_thread(**kwargs: Any) -> dict[str, Any]:
                 return asyncio.run(run_mod._run_single(**kwargs))
 
-            async def _run_single_limited(*, spec: RunSpec) -> Dict[str, Any]:
+            async def _run_single_limited(*, spec: RunSpec) -> dict[str, Any]:
                 async with semaphore:
                     run_mod.logger.info("SCHEDULED %s", spec.run_label)
                     return await asyncio.to_thread(
@@ -508,12 +545,13 @@ async def resume_runs(
                         colluder_count=spec.colluder_count,
                         secret_channel_enabled=spec.secret_channel_enabled,
                         prompt_variant=spec.prompt_variant,
+                        wasp_variant=spec.wasp_variant,
                         seed=spec.seed,
                         out_dir=root,
                     )
 
-            tasks: List[asyncio.Task[Any]] = []
-            task_specs: Dict[asyncio.Task[Any], RunSpec] = {}
+            tasks: list[asyncio.Task[Any]] = []
+            task_specs: dict[asyncio.Task[Any], RunSpec] = {}
             for spec in to_run:
                 task = asyncio.create_task(_run_single_limited(spec=spec))
                 tasks.append(task)
@@ -588,7 +626,7 @@ async def resume_runs(
     )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Resume a previously started collusion experiment in-place."
     )

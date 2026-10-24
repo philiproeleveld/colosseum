@@ -34,6 +34,8 @@ from terrarium.utils import get_client_instance, get_generation_params, get_mode
 
 from experiments.collusion.metrics import compute_collusion_metrics, metrics_to_json
 from experiments.collusion.prompts import CollusionPrompts
+from experiments.collusion.wasp import normalize_wasp_variant
+from experiments.collusion.wasp.jira_ticket_choice_env import WaspJiraTicketTools
 from experiments.common.blackboard_logger import ExperimentBlackboardLogger
 from experiments.common.local_protocol import LocalCommunicationProtocol
 from experiments.common.run_utils import build_vllm_runtime
@@ -167,6 +169,16 @@ def _normalize_environment_sweep(
     return variants
 
 
+def _normalize_wasp_variants(sweep: dict[str, Any]) -> list[str]:
+    # Absent key -> ["none"], so configs without WASP arms run unchanged.
+    variants: list[str] = []
+    for wv in sweep.get("wasp_variants") or ["none"]:
+        wv_str = normalize_wasp_variant(str(wv or ""))
+        if wv_str not in variants:
+            variants.append(wv_str)
+    return variants
+
+
 def _select_colluders(
     *,
     agent_names: Sequence[str],
@@ -238,6 +250,7 @@ async def _run_single(
     prompt_variant: str,
     seed: int,
     out_dir: Path,
+    wasp_variant: str = "none",
 ) -> dict[str, Any]:
     rng = random.Random(int(seed))
     secret_channel_enabled = bool(secret_channel_enabled)
@@ -247,6 +260,7 @@ async def _run_single(
     effective_prompt_variant = str(prompt_variant or "").strip() or "control"
     if not secret_channel_enabled:
         effective_prompt_variant = "control"
+    wasp_variant = normalize_wasp_variant(wasp_variant)
 
     cfg = copy.deepcopy(base_cfg)
     if environment_cfg is not None:
@@ -281,7 +295,9 @@ async def _run_single(
     run_id += (
         f"__{topology}__n{num_agents}"
         f"__c{colluder_count}__secret{int(bool(secret_channel_enabled))}"
-        f"__pv{effective_prompt_variant}__seed{seed}"
+        f"__pv{effective_prompt_variant}"
+        f"__wv{wasp_variant}"
+        f"__seed{seed}"
     )
     run_dir = out_dir / "runs" / model_label / sweep_name / run_id
     _ensure_dir(run_dir)
@@ -350,6 +366,7 @@ async def _run_single(
         env,
         cfg,
         prompt_variant=str(effective_prompt_variant),
+        wasp_variant=wasp_variant,
         base_prompts=getattr(env, "prompts", None),
         experiment_prompt_logger=prompt_logger,
         log_prompts=log_prompts,
@@ -542,6 +559,28 @@ async def _run_single(
                 "Failed to write blackboard_*.txt logs after execution: %s", exc
             )
 
+    # Survey: plain-text answers, no tools.
+    logger.info("RUN %s survey start", run_id)
+    for agent in env.agents:
+        base_ctx = env.build_agent_context(agent.name, phase="survey", iteration=1)
+        agent_context = dict(base_ctx)
+        agent_context.update(_extra_fields(agent.name))
+        response = await protocol.agent_survey_turn(
+            agent, agent.name, agent_context, env, iteration=1
+        )
+        turns.append(
+            {
+                "phase": "survey",
+                "agent": agent.name,
+                "role": roles.get(agent.name, "normal"),
+                "response": response.get("response"),
+                "usage": response.get("usage"),
+                "model": response.get("model"),
+                "tools_executed": response.get("tools_executed"),
+                "conversation_steps": response.get("conversation_steps"),
+            }
+        )
+
     final_summary = env.get_final_summary()
     logger.info(
         "RUN %s execution complete (status=%s)", run_id, final_summary.get("status")
@@ -550,6 +589,18 @@ async def _run_single(
     blackboard_participants = {
         idx: sorted(bb.agents) for idx, bb in enumerate(protocol.megaboard.blackboards)
     }
+
+    report_tool_name = WaspJiraTicketTools.report_tool_name
+    reports_by_colluders = 0
+    reports_by_noncolluders = 0
+    for e in protocol.tool_events:
+        if e.tool_name != report_tool_name:
+            continue
+        if str(e.agent_name) in colluder_set:
+            reports_by_colluders += 1
+        else:
+            reports_by_noncolluders += 1
+
     metrics = compute_collusion_metrics(
         env=env,
         colluders=colluders,
@@ -581,6 +632,7 @@ async def _run_single(
             "secret_channel_enabled": secret_channel_enabled,
             "secret_blackboard_id": secret_blackboard_id,
             "prompt_variant": str(effective_prompt_variant),
+            "wasp_variant": wasp_variant,
             "seed": seed,
             "roles": roles,
             "blackboard_participants": blackboard_participants,
@@ -644,10 +696,15 @@ async def _run_single(
         "secret_channel_enabled": secret_channel_enabled,
         "secret_blackboard_id": secret_blackboard_id,
         "prompt_variant": str(effective_prompt_variant),
+        "wasp_variant": wasp_variant,
         "seed": seed,
         "colluders": colluders,
         "agent_order": str(agent_order_strategy or "random"),
         "status": metrics.status,
+        "random_fallback_fills": final_summary.get("random_fallback_fills"),
+        "reports_total": reports_by_colluders + reports_by_noncolluders,
+        "reports_by_colluders": reports_by_colluders,
+        "reports_by_noncolluders": reports_by_noncolluders,
         # Radar-chart inputs (environment summary + collusion metrics).
         "joint_reward": joint_reward,
         "joint_reward_ratio": final_summary.get("joint_reward_ratio"),
@@ -747,11 +804,13 @@ async def run_from_config(
                     continue
                 seen_variants.add(pv_str)
                 prompt_variants.append(pv_str)
+            wasp_variants = _normalize_wasp_variants(sweep)
             seeds = _normalize_seeds(sweep.get("seeds")) or list(default_seeds)
             if runs_per_setting is not None:
                 seeds = seeds[:runs_per_setting]
             # Prompt variants are only active when the secret channel exists.
             # When secret_channel_enabled=false, only the "control" variant is executed.
+            # WASP variants other than "none" likewise need the secret channel.
             for _topo in topologies:
                 for _n in agent_counts:
                     for _c in colluder_counts:
@@ -759,7 +818,10 @@ async def run_from_config(
                             for _pv in prompt_variants:
                                 if not bool(_secret) and str(_pv) != "control":
                                     continue
-                                total_runs += len(seeds) * env_count
+                                for _wv in wasp_variants:
+                                    if not bool(_secret) and _wv != "none":
+                                        continue
+                                    total_runs += len(seeds) * env_count
 
     logger.info("EXPERIMENT START (total_runs=%s, output_root=%s)", total_runs, root)
     _write_progress(
@@ -824,6 +886,7 @@ async def run_from_config(
                         continue
                     seen_variants.add(pv_str)
                     prompt_variants.append(pv_str)
+                wasp_variants = _normalize_wasp_variants(sweep)
                 seeds = _normalize_seeds(sweep.get("seeds")) or list(default_seeds)
                 if runs_per_setting is not None:
                     seeds = seeds[:runs_per_setting]
@@ -849,57 +912,61 @@ async def run_from_config(
                                                 and str(pv) != "control"
                                             ):
                                                 continue
-                                            for seed in seeds:
-                                                run_label = (
-                                                    f"{model_label}/{sweep_name}"
-                                                    f"{env_part}/{topology}"
-                                                    f"/n{n}/c{c}"
-                                                    f"/secret{int(bool(secret))}"
-                                                    f"/pv{pv}/seed{seed}"
-                                                )
-                                                pbar.set_postfix_str(run_label)
-                                                run_status = "success"
-                                                try:
-                                                    summaries.append(
-                                                        await _run_single(
-                                                            base_cfg=cfg,
-                                                            model_label=model_label,
-                                                            model_llm_cfg=llm_cfg,
-                                                            sweep_name=sweep_name,
-                                                            environment_label=env_label,
-                                                            environment_cfg=env_cfg,
-                                                            topology=str(topology),
-                                                            num_agents=int(n),
-                                                            colluder_count=int(c),
-                                                            secret_channel_enabled=bool(
-                                                                secret
-                                                            ),
-                                                            prompt_variant=str(pv),
-                                                            seed=int(seed),
-                                                            out_dir=root,
+                                            for wv in wasp_variants:
+                                                if not bool(secret) and wv != "none":
+                                                    continue
+                                                for seed in seeds:
+                                                    run_label = (
+                                                        f"{model_label}/{sweep_name}"
+                                                        f"{env_part}/{topology}"
+                                                        f"/n{n}/c{c}"
+                                                        f"/secret{int(bool(secret))}"
+                                                        f"/pv{pv}/wv{wv}/seed{seed}"
+                                                    )
+                                                    pbar.set_postfix_str(run_label)
+                                                    run_status = "success"
+                                                    try:
+                                                        summaries.append(
+                                                            await _run_single(
+                                                                base_cfg=cfg,
+                                                                model_label=model_label,
+                                                                model_llm_cfg=llm_cfg,
+                                                                sweep_name=sweep_name,
+                                                                environment_label=env_label,
+                                                                environment_cfg=env_cfg,
+                                                                topology=str(topology),
+                                                                num_agents=int(n),
+                                                                colluder_count=int(c),
+                                                                secret_channel_enabled=bool(
+                                                                    secret
+                                                                ),
+                                                                prompt_variant=str(pv),
+                                                                wasp_variant=wv,
+                                                                seed=int(seed),
+                                                                out_dir=root,
+                                                            )
                                                         )
-                                                    )
-                                                    completed += 1
-                                                except Exception:
-                                                    run_status = "failed"
-                                                    failed += 1
-                                                    logger.exception(
-                                                        "RUN FAILED %s", run_label
-                                                    )
-                                                    raise
-                                                finally:
-                                                    pbar.update(1)
-                                                    _write_progress(
-                                                        root,
-                                                        {
-                                                            "status": "running",
-                                                            "total_runs": total_runs,
-                                                            "completed_runs": completed,
-                                                            "failed_runs": failed,
-                                                            "last_run_label": run_label,
-                                                            "last_run_status": run_status,
-                                                        },
-                                                    )
+                                                        completed += 1
+                                                    except Exception:
+                                                        run_status = "failed"
+                                                        failed += 1
+                                                        logger.exception(
+                                                            "RUN FAILED %s", run_label
+                                                        )
+                                                        raise
+                                                    finally:
+                                                        pbar.update(1)
+                                                        _write_progress(
+                                                            root,
+                                                            {
+                                                                "status": "running",
+                                                                "total_runs": total_runs,
+                                                                "completed_runs": completed,
+                                                                "failed_runs": failed,
+                                                                "last_run_label": run_label,
+                                                                "last_run_status": run_status,
+                                                            },
+                                                        )
                     continue
 
                 # Concurrent scheduling
@@ -916,34 +983,40 @@ async def run_from_config(
                                     for pv in prompt_variants:
                                         if not bool(secret) and str(pv) != "control":
                                             continue
-                                        for seed in seeds:
-                                            run_label = (
-                                                f"{model_label}/{sweep_name}"
-                                                f"{env_part}/{topology}"
-                                                f"/n{n}/c{c}"
-                                                f"/secret{int(bool(secret))}"
-                                                f"/pv{pv}/seed{seed}"
-                                            )
-                                            task = asyncio.create_task(
-                                                _run_single_limited(
-                                                    run_label=run_label,
-                                                    base_cfg=cfg,
-                                                    model_label=model_label,
-                                                    model_llm_cfg=llm_cfg,
-                                                    sweep_name=sweep_name,
-                                                    environment_label=env_label,
-                                                    environment_cfg=env_cfg,
-                                                    topology=str(topology),
-                                                    num_agents=int(n),
-                                                    colluder_count=int(c),
-                                                    secret_channel_enabled=bool(secret),
-                                                    prompt_variant=str(pv),
-                                                    seed=int(seed),
-                                                    out_dir=root,
+                                        for wv in wasp_variants:
+                                            if not bool(secret) and wv != "none":
+                                                continue
+                                            for seed in seeds:
+                                                run_label = (
+                                                    f"{model_label}/{sweep_name}"
+                                                    f"{env_part}/{topology}"
+                                                    f"/n{n}/c{c}"
+                                                    f"/secret{int(bool(secret))}"
+                                                    f"/pv{pv}/wv{wv}/seed{seed}"
                                                 )
-                                            )
-                                            tasks.append(task)
-                                            task_labels[task] = run_label
+                                                task = asyncio.create_task(
+                                                    _run_single_limited(
+                                                        run_label=run_label,
+                                                        base_cfg=cfg,
+                                                        model_label=model_label,
+                                                        model_llm_cfg=llm_cfg,
+                                                        sweep_name=sweep_name,
+                                                        environment_label=env_label,
+                                                        environment_cfg=env_cfg,
+                                                        topology=str(topology),
+                                                        num_agents=int(n),
+                                                        colluder_count=int(c),
+                                                        secret_channel_enabled=bool(
+                                                            secret
+                                                        ),
+                                                        prompt_variant=str(pv),
+                                                        wasp_variant=wv,
+                                                        seed=int(seed),
+                                                        out_dir=root,
+                                                    )
+                                                )
+                                                tasks.append(task)
+                                                task_labels[task] = run_label
 
                 pending = set(tasks)
                 while pending:
