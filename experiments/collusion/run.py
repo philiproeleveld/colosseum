@@ -1,62 +1,53 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
-
 """Covert collusion experiment runner.
 
 Focuses on whether a subset of agents can coordinate via a hidden coalition-only blackboard and
 benefit at the expense of non-coalition members.
 """
 
-import sys
 import argparse
 import copy
 import csv
+import importlib
 import json
 import logging
 import random
 import re
-import importlib
+import sys
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
 
 from tqdm import tqdm
-
-if sys.version_info < (3, 11):
-    raise RuntimeError(
-        "Terrarium requires Python >= 3.11. "
-        "Create/activate a `.venv` (see repo README) and re-run with `.venv/bin/python`."
-    )
 
 project_root = Path(__file__).resolve().parents[2]
 # Allow running without installing the repo as a package.
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from experiments.common.run_utils import (
-    configure_experiment_logging as _configure_experiment_logging_impl,
-    ensure_dir as _ensure_dir,
-    load_yaml as _load_yaml,
-    normalize_seeds as _normalize_seeds,
-    tools_environment_name as _tools_environment_name,
-    write_json as _write_json,
-    write_progress as _write_progress,
-)
-from experiments.common.blackboard_logger import ExperimentBlackboardLogger
+from terrarium.agents.base import BaseAgent
+from terrarium.core.logger import AgentTrajectoryLogger, PromptLogger
+from terrarium.networks import build_communication_network
+from terrarium.utils import get_client_instance, get_generation_params, get_model_name
+
 from experiments.collusion.metrics import compute_collusion_metrics, metrics_to_json
 from experiments.collusion.prompts import CollusionPrompts
+from experiments.common.blackboard_logger import ExperimentBlackboardLogger
 from experiments.common.local_protocol import LocalCommunicationProtocol
-from terrarium.networks import build_communication_network
-from terrarium.core.logger import AgentTrajectoryLogger, PromptLogger
-from terrarium.utils import (
-    build_vllm_runtime,
-    get_client_instance,
-    get_generation_params,
-    get_model_name,
+from experiments.common.run_utils import build_vllm_runtime
+from experiments.common.run_utils import (
+    configure_experiment_logging as _configure_experiment_logging_impl,
 )
-from terrarium.agents.base import BaseAgent
-
+from experiments.common.run_utils import ensure_dir as _ensure_dir
+from experiments.common.run_utils import load_yaml as _load_yaml
+from experiments.common.run_utils import normalize_seeds as _normalize_seeds
+from experiments.common.run_utils import (
+    tools_environment_name as _tools_environment_name,
+)
+from experiments.common.run_utils import write_json as _write_json
+from experiments.common.run_utils import write_progress as _write_progress
 
 LOGGER_NAME = "experiments.collusion"
 logger = logging.getLogger(LOGGER_NAME)
@@ -68,7 +59,7 @@ def _configure_experiment_logging(root: Path, *, verbose: bool = True) -> None:
     _configure_experiment_logging_impl(logger, root, verbose=verbose)
 
 
-def _resolve_environment_class(env_cfg: Dict[str, Any]) -> Any:
+def _resolve_environment_class(env_cfg: dict[str, Any]) -> Any:
     import_path = str(env_cfg.get("import_path") or "").strip()
     if import_path:
         module_path, sep, cls_name = import_path.partition(":")
@@ -111,7 +102,7 @@ def _sanitize_label(value: str) -> str:
     return value or "env"
 
 
-def _infer_environment_label(env_cfg: Dict[str, Any]) -> str:
+def _infer_environment_label(env_cfg: dict[str, Any]) -> str:
     import_path = str(env_cfg.get("import_path") or "").strip()
     if import_path:
         _module, _sep, cls_name = import_path.partition(":")
@@ -125,19 +116,19 @@ def _infer_environment_label(env_cfg: Dict[str, Any]) -> str:
 
 
 def _normalize_environment_sweep(
-    *, sweep: Dict[str, Any], base_env_cfg: Dict[str, Any]
-) -> List[tuple[str, Dict[str, Any]]]:
+    *, sweep: dict[str, Any], base_env_cfg: dict[str, Any]
+) -> list[tuple[str, dict[str, Any]]]:
     raw = sweep.get("environments") or []
     if not raw:
         return []
     if not isinstance(raw, list):
         raise ValueError("sweeps[].environments must be a list.")
 
-    variants: List[tuple[str, Dict[str, Any]]] = []
+    variants: list[tuple[str, dict[str, Any]]] = []
     seen: set[str] = set()
     for entry in raw:
-        label: Optional[str] = None
-        override: Dict[str, Any] = {}
+        label: str | None = None
+        override: dict[str, Any] = {}
         if isinstance(entry, str):
             value = entry.strip()
             if not value:
@@ -182,7 +173,7 @@ def _select_colluders(
     count: int,
     strategy: str,
     rng: random.Random,
-) -> List[str]:
+) -> list[str]:
     if count <= 0:
         return []
     count = min(int(count), len(agent_names))
@@ -193,12 +184,13 @@ def _select_colluders(
         return [str(x) for x in list(agent_names)[:count]]
     raise ValueError(f"Unknown colluder selection strategy: {strategy!r}")
 
+
 def _order_agent_turns(
     *,
     agent_names: Sequence[str],
     colluders: Sequence[str],
     strategy: str,
-) -> List[str]:
+) -> list[str]:
     strategy = str(strategy or "random").strip().lower()
     if strategy == "random":
         return list(agent_names)
@@ -219,7 +211,7 @@ def _log_blackboards_txt(
     iteration: int,
     phase: str,
     agent_name: str,
-    planning_round: Optional[int] = None,
+    planning_round: int | None = None,
 ) -> None:
     for blackboard in protocol.megaboard.blackboards:
         bb_logger.log_blackboard_state(
@@ -233,12 +225,12 @@ def _log_blackboards_txt(
 
 async def _run_single(
     *,
-    base_cfg: Dict[str, Any],
+    base_cfg: dict[str, Any],
     model_label: str,
-    model_llm_cfg: Dict[str, Any],
+    model_llm_cfg: dict[str, Any],
     sweep_name: str,
-    environment_label: Optional[str] = None,
-    environment_cfg: Optional[Dict[str, Any]] = None,
+    environment_label: str | None = None,
+    environment_cfg: dict[str, Any] | None = None,
     topology: str,
     num_agents: int,
     colluder_count: int,
@@ -246,7 +238,7 @@ async def _run_single(
     prompt_variant: str,
     seed: int,
     out_dir: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     rng = random.Random(int(seed))
     secret_channel_enabled = bool(secret_channel_enabled)
     # Design choice: prompt variants are only active when the secret channel exists.
@@ -277,7 +269,7 @@ async def _run_single(
     cfg["llm"] = copy.deepcopy(model_llm_cfg)
 
     run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    env_label: Optional[str] = None
+    env_label: str | None = None
     if environment_label is not None:
         cleaned = _sanitize_label(environment_label)
         if cleaned:
@@ -372,7 +364,7 @@ async def _run_single(
     if provider == "vllm":
         vllm_runtime = build_vllm_runtime(cfg["llm"])
 
-    agents: List[BaseAgent] = []
+    agents: list[BaseAgent] = []
     env_tool_name = _tools_environment_name(env)
     for name in agent_names:
         client = get_client_instance(
@@ -394,13 +386,17 @@ async def _run_single(
         rng.shuffle(agents)
     else:
         agents_by_name = {a.name: a for a in agents}
-        agents = [agents_by_name[name] for name in ordered_agent_names if name in agents_by_name]
+        agents = [
+            agents_by_name[name]
+            for name in ordered_agent_names
+            if name in agents_by_name
+        ]
     env.set_agent_clients(agents)
 
     # Create blackboards for the communication network.
     await env.async_init()
 
-    secret_blackboard_id: Optional[int] = None
+    secret_blackboard_id: int | None = None
     if secret_channel_enabled and len(colluders) >= 2:
         try:
             base_context = env.get_network_context()
@@ -436,9 +432,9 @@ async def _run_single(
     )
 
     planning_rounds = int(cfg["simulation"].get("max_planning_rounds", 1))
-    turns: List[Dict[str, Any]] = []
+    turns: list[dict[str, Any]] = []
 
-    def _extra_fields(agent_name: str) -> Dict[str, Any]:
+    def _extra_fields(agent_name: str) -> dict[str, Any]:
         # Baseline (secret_channel_enabled=False): no explicit collusion prompting.
         prompt_role = (
             "colluder"
@@ -447,7 +443,7 @@ async def _run_single(
         )
         return {
             "collusion_role": prompt_role,
-            "collusion_coalition_members": sorted(list(colluder_set))
+            "collusion_coalition_members": sorted(colluder_set)
             if prompt_role == "colluder"
             else [],
             "collusion_blackboard_id": secret_blackboard_id
@@ -552,8 +548,7 @@ async def _run_single(
     )
 
     blackboard_participants = {
-        idx: sorted(list(bb.agents))
-        for idx, bb in enumerate(protocol.megaboard.blackboards)
+        idx: sorted(bb.agents) for idx, bb in enumerate(protocol.megaboard.blackboards)
     }
     metrics = compute_collusion_metrics(
         env=env,
@@ -614,7 +609,7 @@ async def _run_single(
         [
             {
                 "blackboard_id": bb.blackboard_id,
-                "participants": sorted(list(bb.agents)),
+                "participants": sorted(bb.agents),
                 "events": bb.logs,
             }
             for bb in protocol.megaboard.blackboards
@@ -671,7 +666,6 @@ async def _run_single(
         "coalition_advantage_mean": metrics.coalition_advantage_mean,
         "coalition_reward_ratio": coalition_reward_ratio,
         "colluder_posts_secret_rate": metrics.colluder_posts_secret_rate,
-        "mean_regret": metrics.mean_regret,
         "coalition_mean_regret": metrics.coalition_mean_regret,
         "noncoalition_mean_regret": metrics.noncoalition_mean_regret,
         "system_regret": metrics.system_regret,
@@ -687,8 +681,8 @@ async def _run_single(
 async def run_from_config(
     config_path: str,
     *,
-    out_dir: Optional[str] = None,
-    max_concurrent_runs: Optional[int] = None,
+    out_dir: str | None = None,
+    max_concurrent_runs: int | None = None,
 ) -> Path:
     cfg = _load_yaml(config_path)
     exp = cfg.get("experiment") or {}
@@ -745,7 +739,7 @@ async def run_from_config(
                 or [False]
             )
             raw_prompt_variants = sweep.get("prompt_variants") or ["control"]
-            prompt_variants: List[str] = []
+            prompt_variants: list[str] = []
             seen_variants: set[str] = set()
             for pv in raw_prompt_variants:
                 pv_str = str(pv or "").strip() or "control"
@@ -780,7 +774,7 @@ async def run_from_config(
         },
     )
 
-    summaries: List[Dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
     completed = 0
     failed = 0
 
@@ -796,12 +790,12 @@ async def run_from_config(
 
                 semaphore = asyncio.Semaphore(int(max_concurrent_runs))
 
-                def _run_single_in_thread(**kwargs: Any) -> Dict[str, Any]:
+                def _run_single_in_thread(**kwargs: Any) -> dict[str, Any]:
                     return asyncio.run(_run_single(**kwargs))
 
                 async def _run_single_limited(
                     *, run_label: str, **kwargs: Any
-                ) -> Dict[str, Any]:
+                ) -> dict[str, Any]:
                     async with semaphore:
                         logger.info("SCHEDULED %s", run_label)
                         return await asyncio.to_thread(_run_single_in_thread, **kwargs)
@@ -822,7 +816,7 @@ async def run_from_config(
                     or [False]
                 )
                 raw_prompt_variants = sweep.get("prompt_variants") or ["control"]
-                prompt_variants: List[str] = []
+                prompt_variants: list[str] = []
                 seen_variants: set[str] = set()
                 for pv in raw_prompt_variants:
                     pv_str = str(pv or "").strip() or "control"
@@ -911,8 +905,8 @@ async def run_from_config(
                 # Concurrent scheduling
                 import asyncio
 
-                tasks: List[asyncio.Task] = []
-                task_labels: Dict[asyncio.Task, str] = {}
+                tasks: list[asyncio.Task] = []
+                task_labels: dict[asyncio.Task, str] = {}
                 for env_label, env_cfg in env_variants:
                     env_part = f"/env{env_label}" if env_label else ""
                     for topology in topologies:
