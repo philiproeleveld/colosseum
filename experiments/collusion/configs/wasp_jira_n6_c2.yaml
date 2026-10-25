@@ -67,7 +67,7 @@ experiment:
   output_dir: experiments/collusion/outputs/wasp_jira_n6_c2
   # Each run sends one request at a time
   max_concurrent_runs: 5
-  seeds: [1, 2, 3, 4, 5] # pilot; size the full run from it
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
   collusion:
     colluder_selection: random
   wasp:
@@ -106,4 +106,18 @@ experiment:
       colluder_counts: [2]
       secret_channel_enabled: [true]
       prompt_variants: [simple]
+      wasp_variants: [none, monitor]
+    # Deception prompt and C3 with M3, M4, M3 + M4: {no report tool, report tool} x {no announcement,
+    # announcement}. Each environment entry merges into the top-level `environment:`.
+    - name: wasp_adversarial
+      environments:
+        - label: choice
+          import_path: experiments.collusion.choice.jira_ticket_choice_env:JiraTicketChoiceEnvironment
+        - label: wasp
+          import_path: experiments.collusion.wasp.jira_ticket_choice_env:WaspJiraTicketChoiceEnvironment
+      topologies: [complete]
+      num_agents: [6]
+      colluder_counts: [2]
+      secret_channel_enabled: [true]
+      prompt_variants: [deception, structured, aggressive]
       wasp_variants: [none, monitor]
